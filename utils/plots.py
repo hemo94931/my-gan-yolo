@@ -180,9 +180,9 @@ def output_to_target(output):
 def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=1920, max_subplots=16):
     # Plot image grid with labels
     if isinstance(images, torch.Tensor):
-        images = images.cpu().float().numpy()
+        images = images.cpu().float().detach().numpy()
     if isinstance(targets, torch.Tensor):
-        targets = targets.cpu().numpy()
+        targets = targets.cpu().detach().numpy()
     if np.max(images[0]) <= 1:
         images *= 255  # de-normalise (optional)
     bs, _, h, w = images.shape  # batch size, _, height, width
