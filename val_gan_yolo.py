@@ -43,7 +43,7 @@ from utils.general import (LOGGER, box_iou, check_dataset, check_img_size, check
                            coco80_to_coco91_class, colorstr, increment_path, non_max_suppression, print_args,
                            scale_coords, xywh2xyxy, xyxy2xywh)
 from utils.metrics import ConfusionMatrix, ap_per_class
-from utils.plots import output_to_target, plot_images, plot_val_study
+from utils.plots import output_to_target, plot_images, plot_val_study, plot_gan_images
 from utils.torch_utils import select_device, time_sync
 from models import networks
 
@@ -96,6 +96,7 @@ def process_batch(detections, labels, iouv):
 @torch.no_grad()
 def run(data,
         weights=None,  # model.pt path(s)
+        gan_weights=None,
         batch_size=32,  # batch size
         imgsz=640,  # inference size (pixels)
         conf_thres=0.001,  # confidence threshold
@@ -117,6 +118,7 @@ def run(data,
         dnn=False,  # use OpenCV DNN for ONNX inference
         model=None,
         gan_model=None,
+        save_gan_img=False,
         dataloader=None,
         save_dir=Path(''),
         plots=True,
@@ -137,8 +139,10 @@ def run(data,
         
         gan_model = networks.define_G(3, 3, 64, 'unet_256', 'batch',
                                       True, 'normal', 0.02, device_ids)
-        netG_load_path = opt.gan_model
-        state_dict_netG = torch.load(netG_load_path)
+        if gan_weights is None or gan_weights == '': 
+            t = os.path.split(weights[0])[0]
+            gan_weights = os.path.join(t, 'netG_best.pt')
+        state_dict_netG = torch.load(gan_weights)
         if hasattr(state_dict_netG, '_metadata'):
             del state_dict_netG._metadata
         if isinstance(gan_model, torch.nn.DataParallel):
@@ -180,7 +184,7 @@ def run(data,
     # Dataloader
     if not training:
         model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz), half=half)  # warmup
-        pad = 0.0 if task in ('speed', 'benchmark') or gan_model is not None else 0.5
+        pad = 0.0 # if task in ('speed', 'benchmark') or gan_model is not None else 0.5
         rect = False if task == 'benchmark' else pt  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         test_path_rgb = data[task + '_rgb']
@@ -228,8 +232,12 @@ def run(data,
         upconv = nn.Upsample(scale_factor=2, mode='bilinear',align_corners = True)
         img_ir = denormalizer(img_ir)
         gan_img = denormalizer(gan_img)
-        img_ir_resize = upconv(img_ir)
-        gan_img_resize = upconv(gan_img)
+        if imgsz == 1024:
+            img_ir_resize = upconv(img_ir)
+            gan_img_resize = upconv(gan_img)
+        else:
+            img_ir_resize = img_ir
+            gan_img_resize = gan_img
         gan_img_resize = gan_img_resize.half() if half else gan_img_resize.float()
         nb, _, height, width = gan_img_resize.shape  # batch size, channels, height, width
         out, train_out = model(gan_img_resize) if training else model(gan_img_resize, augment=augment, val=True)  # inference, loss outputs
@@ -293,6 +301,10 @@ def run(data,
         Thread(target=plot_images, args=(img_ir_resize, targets, paths, f, names), daemon=True).start()
         f = save_dir / f'val_batch{batch_i}_pred.jpg'  # predictions
         Thread(target=plot_images, args=(gan_img_resize, output_to_target(out), paths, f, names), daemon=True).start()
+        
+        if save_gan_img:
+            Thread(target=plot_gan_images, args=(img_ir_resize, paths, f, 'real'), daemon=True).start()
+            Thread(target=plot_gan_images, args=(gan_img_resize, paths, f, 'fake'), daemon=True).start()
 
     # Compute metrics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
@@ -367,7 +379,7 @@ def parse_opt():
     parser.add_argument('--data', type=str, default=ROOT / 'data/gan_detection_tx.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model.pt path(s)')
     parser.add_argument('--batch-size', type=int, default=32, help='batch size')
-    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=1024, help='inference size (pixels)')
+    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=512, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
@@ -385,7 +397,8 @@ def parse_opt():
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
-    parser.add_argument('--gan-model', type=str, default='/root/workspace/project/my-gan-yolo/runs/train/exp49/weights/netG_best.pt', help='gan model')
+    parser.add_argument('--gan-weights', type=str, default='', help='gan model')
+    parser.add_argument('--save-gan-img', action='store_true', help='store gan img')
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')

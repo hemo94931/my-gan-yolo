@@ -237,6 +237,31 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
                     annotator.box_label(box, label, color=color)
     annotator.im.save(fname)  # save
 
+def plot_gan_images(images, paths, save_dir, dname):
+    # Plot image grid with labels
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().float().detach().numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.cpu().detach().numpy()
+    if np.max(images[0]) <= 1:
+        images *= 255  # de-normalise (optional)
+    bs, _, h, w = images.shape  # batch size, _, height, width
+
+    # Build Image
+    for i, im, path in enumerate(zip(images, paths)):
+        im = im.transpose(1, 2, 0)
+        im_name = Path(path).name
+        im_path = Path(save_dir, dname, im_name)
+        if not im_path.parent.exists():
+            im_path.parent.mkdir(parents=True, exist_ok=True)
+        # cv2.imwrite(str(im_path), im)
+        print('save image to ', im_path)
+        
+        
+        
+        
+        
+
 
 def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
     # Plot LR simulating training for full epochs

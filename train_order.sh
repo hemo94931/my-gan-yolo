@@ -1,0 +1,2 @@
+# python train_gan_yolo.py --weights /root/workspace/project/my-yolov5/experiment/cls_1_pretrain_petct_label_imgsz512_gan52_1117/weights/best2.pt  --imgsz 512 --data data/gan_detection_kfold1.yaml --device 0,1,2,3 --epoch 50 --batch-size 12
+python train_gan_yolo.py --weights /root/workspace/project/my-yolov5/experiment/cls_1_pretrain_petct_label_imgsz512_gan52_1117/weights/best.pt  --imgsz 512 --data data/gan_detection_kfold1.yaml --device 0,1,2,3 --epoch 50 --batch-size 12

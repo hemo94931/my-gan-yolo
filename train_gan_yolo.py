@@ -29,6 +29,7 @@ import torch.nn as nn
 import yaml
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.nn.functional as F
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
 
@@ -60,14 +61,16 @@ from utils.denormalizer import denormalizer
 from models import networks
 from models import reg
 from models import transformer
+from models.AutomaticWeightedLoss import AutomaticWeightedLoss
 # import models.reg as reg
 # import models.transformer as transformer
+from gradnorm_pytorch.gradnorm_pytorch import GradNormLossWeighter
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
-def smooothing_loss(y_pred):
+def smoothing_loss(y_pred):
     dy = torch.abs(y_pred[:, :, 1:, :] - y_pred[:, :, :-1, :])
     dx = torch.abs(y_pred[:, :, :, 1:] - y_pred[:, :, :, :-1])
 
@@ -76,6 +79,7 @@ def smooothing_loss(y_pred):
     d = torch.mean(dx) + torch.mean(dy)
     grad = d 
     return d
+
 def set_requires_grad(nets, requires_grad=False):
         """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
         Parameters:
@@ -87,8 +91,158 @@ def set_requires_grad(nets, requires_grad=False):
         for net in nets:
             if net is not None:
                 for param in net.parameters():
-                    
                     param.requires_grad = requires_grad
+
+def weight_l1_loss(y_pred, y_true, x_true):
+    return torch.mean(torch.abs(y_pred - y_true) * (1 + torch.clamp(y_true - x_true / 2, min=0.0, max=1.0)))
+
+def adapt_l1_l2_loss(y_pred, y_true, targets):
+    bc, c, ht, wt = y_pred.shape
+    wi = torch.zeros_like(y_true)
+    for t in list(targets):
+        i = int(t[0])
+        x, y, w, h = t[2:]
+        x = int(x * wt)
+        y = int(y * ht)
+        w = int(w * wt)
+        h = int(h * ht)
+        wi[i, :, y:y+h, x:x+w] = 1
+    a = torch.sum(torch.abs(y_pred - y_true) * (1 - wi)) / torch.sum(1 - wi)
+    b = torch.sum((torch.abs(y_pred - y_true) ** 2) * wi) / torch.sum(wi)
+    return a + b
+
+def argu_defect_loss(y_pred, y_true, targets):
+    bc, c, ht, wt = y_pred.shape
+    wi = torch.zeros_like(y_true)
+    for t in list(targets):
+        i = int(t[0])
+        x, y, w, h = t[2:]
+        x = int(x * wt)
+        y = int(y * ht)
+        w = int(w * wt)
+        h = int(h * ht)
+        wi[i, :, y:y+h, x:x+w] = 1
+    a = torch.sum(torch.abs(y_pred - y_true) * (1 - wi)) / torch.sum(1 - wi)
+    b = torch.sum(torch.abs(y_pred - y_true) * wi * 2) / torch.sum(wi)
+    return a + b
+
+def argu_defect_loss_l2(y_pred, y_true, targets):
+    bc, c, ht, wt = y_pred.shape
+    wi = torch.zeros_like(y_true)
+    for t in list(targets):
+        i = int(t[0])
+        x, y, w, h = t[2:]
+        x = int(x * wt)
+        y = int(y * ht)
+        w = int(w * wt)
+        h = int(h * ht)
+        wi[i, :, y:y+h, x:x+w] = 1
+    # a = torch.sum(torch.abs(y_pred - y_true) * (1 - wi)) / torch.sum(1 - wi)
+    # b = torch.sum(torch.abs(y_pred - y_true) * wi * 2) / torch.sum(wi)
+    a = torch.sum(((y_pred - y_true) ** 2) * (1 - wi)) / torch.sum(1 - wi)
+    b = torch.sum(((y_pred - y_true) ** 2) * wi * 2) / torch.sum(wi)
+    return a + b
+
+class FocalLossRegression(nn.Module):
+    def __init__(self, gamma=2, alpha=1):
+        super(FocalLossRegression, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        # 计算平方损失
+        loss = F.l1_loss(inputs, targets, reduction='none')
+
+        # 计算调整后的权重
+        weights = self.alpha * (1 - torch.exp(-loss)) ** self.gamma
+
+        # 应用权重
+        weighted_loss = weights * loss
+
+        # 求平均损失
+        return torch.sum(weighted_loss)
+
+class RLW(nn.Module):
+    r"""Random Loss Weighting (RLW).
+    
+    This method is proposed in `Reasonable Effectiveness of Random Weighting: A Litmus Test for Multi-Task Learning (TMLR 2022) <https://openreview.net/forum?id=jjtFD8A1Wx>`_ \
+    and implemented by us.
+
+    """
+    def __init__(self, task_num, device):
+        super(RLW, self).__init__()
+        self.task_num = task_num
+        self.device = device
+        
+    def forward(self, losses):
+        losses = torch.stack(losses).to(self.device)
+        batch_weight = F.softmax(torch.randn(self.task_num), dim=-1).to(self.device)
+        loss = torch.mul(losses, batch_weight).sum()
+        return loss
+
+class DWA(nn.Module):
+    r"""Dynamic Weight Average (DWA).
+    
+    This method is proposed in `End-To-End Multi-Task Learning With Attention (CVPR 2019) <https://openaccess.thecvf.com/content_CVPR_2019/papers/Liu_End-To-End_Multi-Task_Learning_With_Attention_CVPR_2019_paper.pdf>`_ \
+    and implemented by modifying from the `official PyTorch implementation <https://github.com/lorenmt/mtan>`_. 
+
+    Args:
+        T (float, default=2.0): The softmax temperature.
+
+    """
+    def __init__(self, task_num, epochs, device):
+        super(DWA, self).__init__()
+        self.task_num = task_num
+        self.T = 2.0
+        self.train_loss_buffer = np.zeros([self.task_num, epochs])
+        self.device = device
+        
+    def update_train_loss_buffer(self, losses, epoch):
+        losses = torch.stack(losses)
+        self.train_loss_buffer[:,epoch] = losses.detach().cpu().numpy()
+        
+    def forward(self, losses, epoch):
+        losses = torch.stack(losses).to(self.device)
+        if epoch > 1:
+            w_i = torch.Tensor(self.train_loss_buffer[:,epoch-1]/self.train_loss_buffer[:,epoch-2]).to(self.device)
+            batch_weight = self.task_num*F.softmax(w_i/self.T, dim=-1)
+        else:
+            batch_weight = torch.ones_like(losses).to(self.device)
+        loss = torch.mul(losses, batch_weight).sum()
+        return loss
+    
+class DWA2(nn.Module):
+    r"""Dynamic Weight Average (DWA).
+    
+    以Batch为时间单位的更新
+
+    Args:
+        T (float, default=2.0): The softmax temperature.
+
+    """
+    def __init__(self, task_num, batchs, device):
+        super(DWA2, self).__init__()
+        self.task_num = task_num
+        self.T = 2.0
+        self.train_loss_buffer = np.zeros([self.task_num, batchs])
+        self.device = device
+        
+    def update_train_loss_buffer(self, losses, batch):
+        losses = torch.stack(losses)
+        b = batch % self.train_loss_buffer.shape[1]
+        self.train_loss_buffer[:,b] = losses.detach().cpu().numpy()
+        
+    def forward(self, losses, batch):
+        losses = torch.stack(losses).to(self.device)
+        if batch > 1:
+            b1 = (batch - 1) % self.train_loss_buffer.shape[1]
+            b2 = (batch - 2) % self.train_loss_buffer.shape[1]
+            w_i = torch.Tensor(self.train_loss_buffer[:,b1]/self.train_loss_buffer[:,b2]).to(self.device)
+            batch_weight = self.task_num*F.softmax(w_i/self.T, dim=-1)
+        else:
+            batch_weight = torch.ones_like(losses).to(self.device)
+        loss = torch.mul(losses, batch_weight).sum()
+        return loss
 
 def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt,
@@ -300,15 +454,18 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     
     #gan
     # netD注释掉
-    netD = networks.define_D(6, 64, 'basic', 3, 'batch', 'normal', 0.02, [0,1,2,3])
-    netG =  networks.define_G(3, 3, 64, 'unet_256', 'batch', True, 'normal', 0.02, [0,1,2,3])
-    netG_load_path = os.path.join('/root/workspace/project/my-pytorch-CycleGAN-and-pix2pix/get_sh_and_pth/pth/class_5_1/epoch_183/','183_net_G.pth')
+    device_ids = [int(id_) for id_ in opt.device.split(',')]
+    netD = networks.define_D(6, 64, 'basic', 3, 'batch', 'normal', 0.02, device_ids)
+    netG =  networks.define_G(3, 3, 64, 'unet_256', 'batch', True, 'normal', 0.02, device_ids)
+    epoch_num = '52' # 52 183
+    netG_load_path = os.path.join('/root/workspace/project/my-pytorch-CycleGAN-and-pix2pix/get_sh_and_pth/pth/class_5_1/epoch_{}/'.format(epoch_num),'{}_net_G.pth'.format(epoch_num))
     state_dict_netG = torch.load(netG_load_path)
-    netD_load_path = os.path.join('/root/workspace/project/my-pytorch-CycleGAN-and-pix2pix/get_sh_and_pth/pth/class_5_1/epoch_183/','183_net_D.pth')
+    netD_load_path = os.path.join('/root/workspace/project/my-pytorch-CycleGAN-and-pix2pix/get_sh_and_pth/pth/class_5_1/epoch_{}/'.format(epoch_num),'{}_net_D.pth'.format(epoch_num))
     state_dict_netD = torch.load(netD_load_path)
-    netRA_load_path = os.path.join('/root/workspace/project/my-pytorch-CycleGAN-and-pix2pix/get_sh_and_pth/pth/class_5_1/epoch_183/','183_net_R_A.pth')
+    netRA_load_path = os.path.join('/root/workspace/project/my-pytorch-CycleGAN-and-pix2pix/get_sh_and_pth/pth/class_5_1/epoch_{}/'.format(epoch_num),'{}_net_R_A.pth'.format(epoch_num))
     state_dict_netRA = torch.load(netRA_load_path)
 
+    
     
     if hasattr(state_dict_netG, '_metadata'):
         del state_dict_netG._metadata
@@ -321,13 +478,13 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         netD.module.load_state_dict(state_dict_netD)
     else:
         netD.load_state_dict(state_dict_netD)
-        netD = nn.DataParallel(netD, device_ids=[0, 1, 2, 3]) 
+        netD = nn.DataParallel(netD, device_ids=device_ids) 
     
     if isinstance(netG, torch.nn.DataParallel):
         netG.module.load_state_dict(state_dict_netG)
     else:
         netG.load_state_dict(state_dict_netG)
-        netG = nn.DataParallel(netG, device_ids=[0, 1, 2, 3]) 
+        netG = nn.DataParallel(netG, device_ids=device_ids) 
         
     # for k, v in netG.named_parameters():
     #     v.requires_grad = False  # train all layers
@@ -338,23 +495,56 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     
     # REG注释掉
     netR_A.load_state_dict(state_dict_netRA)
-    netR_A = nn.DataParallel(netR_A, device_ids=[0, 1, 2, 3])
+    netR_A = nn.DataParallel(netR_A, device_ids=device_ids)
     
     criterionGAN = networks.GANLoss('vanilla').to(device)
     
     criterionL1 = torch.nn.L1Loss()
     criterionL2 = torch.nn.MSELoss()
+    criterionPix = FocalLossRegression()
     # netD注释掉
     optimizer_D = torch.optim.Adam(netD.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    # optimizer_D = torch.optim.SGD(netD.parameters(), lr=0.00005, momentum=hyp['momentum'])
+    
     optimizer_G = torch.optim.Adam(netG.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    # optimizer_G = torch.optim.SGD(netG.parameters(), lr=0.0005, momentum=hyp['momentum'])
+    # optimizer.add_param_group({'params': g2})
     # Reg注释掉
     optimizer_R_A = torch.optim.Adam(netR_A.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    # optimizer_R_A = torch.optim.SGD(netR_A.parameters(), lr=0.0005, momentum=hyp['momentum'])
     
     # netD注释掉
     scheduler_D = lr_scheduler.LambdaLR(optimizer_D, lr_lambda=lf)
     scheduler_G = lr_scheduler.LambdaLR(optimizer_G, lr_lambda=lf)
     # Reg注释掉
     scheduler_R_A = lr_scheduler.LambdaLR(optimizer_R_A, lr_lambda=lf)
+    
+    # AWL 多任务权重
+    # awl = AutomaticWeightedLoss(num=5, weight=[0.5, 0.001, 0.05, 0.1, 0.8])
+    # # optimizer_awl = SGD(awl.parameters(), lr=0.0002, momentum=hyp['momentum'])
+    # optimizer_awl = torch.optim.Adam(awl.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    # scheduler_awl = lr_scheduler.LambdaLR(optimizer_awl, lr_lambda=lf)
+    
+    # random 多任务权重
+    # rlw = RLW(task_num=5, device=device)
+    
+    ## DWA
+    # dwa = DWA(task_num=5, epochs=epochs, device=device)
+    
+    ## DWA2
+    # dwa2 = DWA2(task_num=5, batchs=nb, device=device)
+    
+    # GradNorm 多任务权重
+    # backbone_parameter = netG.module.model.model[-2].weight
+    # print(backbone_parameter)
+    # loss_weighter = GradNormLossWeighter(
+    #     num_losses = 5,
+    #     learning_rate = 1e-4,
+    #     restoring_force_alpha = 0.,                  # 0. is perfectly balanced losses, while anything greater than 1 would account for the relative training rates of each loss. in the paper, they go as high as 3.
+    #     grad_norm_parameters = backbone_parameter
+    # )
+    
+    
     #gan
     
     
@@ -374,6 +564,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    mid_stop_epoch = epochs - 10 if epochs > 10 else epochs // 2
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -387,17 +578,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        #zjh add
-        mloss = torch.zeros(7, device=device)  # mean losses
-        #zjh add
-        # mloss = torch.zeros(7, device=device)  # mean losses
+        mloss = torch.zeros(10, device=device)  # mean losses
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%10s' * 11) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'loss_l1', 'loss_GAN', 'loss_SR', 'loss_SM', 'labels', 'img_size'))
+        LOGGER.info(('\n' + '%13s' * 14) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'loss_D_fake', 'loss_D_real', 'loss_f', 'loss_l1', 'loss_GAN', 'loss_SR', 'loss_SM', 'labels', 'img_size'))
         if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
+        # optimizer_awl.zero_grad()
         for i, (imgs_rgb, imgs_ir, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             # imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
@@ -427,7 +616,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # REG注释掉
             Trans = netR_A(gan_img, imgs_ir) 
             SysRegist_A2B = netspatial_transform(gan_img, Trans)
-            
+            # if i == 0 or i % 2 == 0:
             # netD注释掉
             set_requires_grad(netD, True)  # enable backprop for D
             optimizer_D.zero_grad()
@@ -442,11 +631,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
             # combine loss and calculate gradients
             # netD注释掉
-            loss_D = (loss_D_fake + loss_D_real) * 0.5 
+            loss_D = (loss_D_fake + loss_D_real) * 0.5
             # netD注释掉
             loss_D.backward(retain_graph=True)
             optimizer_D.step()
-             # update G
+            # update G
             # netD注释掉
             set_requires_grad(netD, False)  # enable backprop for D
             optimizer_G.zero_grad()
@@ -457,9 +646,16 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             pred_fake = netD(fake_AB)
             loss_gan = criterionGAN(pred_fake, True)
             loss_L1 = criterionL1(gan_img, imgs_ir) # * 50
+            # loss_L1 = criterionL2(gan_img, imgs_ir) # * 50
+            # loss_L1 = weight_l1_loss(gan_img, imgs_ir, imgs_rgb)
+            # loss_L1 = adapt_l1_l2_loss(gan_img, imgs_ir, targets)
+            # loss_L1 = argu_defect_loss_l2(gan_img, imgs_ir, targets)
+            # loss_L1 = argu_defect_loss(gan_img, imgs_ir, targets)
+            # loss_L1 = criterionPix(gan_img, imgs_ir) / 100
+            
             # REG注释掉
             loss_SR = criterionL1(SysRegist_A2B, imgs_ir) # * 20 ###SR
-            loss_SM = smooothing_loss(Trans) # * 10 ###SM
+            loss_SM = smoothing_loss(Trans) # * 10 ###SM
             # loss_SR = 0
             # loss_SM = 0
 
@@ -470,20 +666,23 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # gan_img = gan_img.div(2)
             
             #zjh add
-            imgs_ir = denormalizer(imgs_ir)
-            imgs_ir_resize = upconv(imgs_ir)
+            # imgs_ir = denormalizer(imgs_ir)
+            # imgs_ir_resize = upconv(imgs_ir)
+            # imgs_ir_resize = imgs_ir
             #zjh add
 
-            gan_resize = upconv(gan_img)
+            if imgsz == 1024:
+                gan_resize = upconv(gan_img)
+            else:
+                gan_resize = gan_img
             with amp.autocast(enabled=cuda):
-                # pred = model(imgs)  # forward
                 pred = model(gan_resize)  # forward
                 loss_f, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 # loss_items = torch.zeros(3, device=device)
                 
                 #zjh add
-                pred_petct = model(imgs_ir_resize)  # forward
-                loss_f_petct, loss_items_petct = compute_loss(pred_petct, targets.to(device))  # loss scaled by batch_size
+                # pred_petct = model(imgs_ir_resize)  # forward
+                # loss_f_petct, loss_items_petct = compute_loss(pred_petct, targets.to(device))  # loss scaled by batch_size
                 #zjh add
 
                 # netD注释掉
@@ -491,31 +690,46 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 # loss_f = 0
 
                 #zjh add
-                loss_all = loss_L1 * 0.2 + loss_gan * 0.1 + loss_SR * 0.1 + loss_SM + loss_f + loss_f_petct
-                loss_items2 = torch.tensor((loss_L1, loss_gan, loss_SR, loss_SM)).to(device)
-                loss_items = torch.cat((loss_items, loss_items2))
-                # loss_items = torch.cat((loss_items, loss_items_petct))
-                #zjh add
-
-                # loss_all = loss_L1 * 0.2 + loss_gan * 0.1 + loss_SR * 0.1 + loss_SM + loss_f
+                # loss_all = loss_L1 * 0.2 + loss_gan * 0.5 + loss_SR * 0.1 + loss_SM + loss_f + loss_f_petct
                 # loss_items2 = torch.tensor((loss_L1, loss_gan, loss_SR, loss_SM)).to(device)
                 # loss_items = torch.cat((loss_items, loss_items2))
+                # loss_items = torch.cat((loss_items, loss_items_petct))
+                #zjh add
+                ## 固定权重
+                loss_all = loss_L1 * 0.5 + loss_gan * 0.001 + loss_SR * 0.05 + loss_SM * 0.1 + loss_f * 0.8
+                ## 早停
+                # if epoch < mid_stop_epoch:
+                #     loss_all = awl(loss_L1, loss_gan, loss_SR, loss_SM, loss_f[0])
+                # else:
+                #     loss_all = loss_L1 * 0.5 + loss_gan * 0.001 + loss_SR * 0.05 + loss_SM * 0.1 + loss_f * 0.8
+                ## 随机
+                # loss_all = rlw([loss_L1, loss_gan, loss_SR, loss_SM, loss_f[0]])
+                ## dwa
+                # loss_all = dwa([loss_L1 * 0.5, loss_gan * 0.001, loss_SR * 0.05, loss_SM * 0.1, loss_f[0] * 0.8], epoch)
+                ## dwa2
+                # loss_all = dwa2([loss_L1 * 0.5, loss_gan * 0.001, loss_SR * 0.05, loss_SM * 0.1, loss_f[0] * 0.8], ni)
+
+                loss_items2 = torch.tensor((loss_D_fake, loss_D_real, loss_f[0], loss_L1, loss_gan, loss_SR, loss_SM)).to(device)
+                loss_items = torch.cat((loss_items, loss_items2))
                 if RANK != -1:
                     loss_all *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss_all *= 4.
 
             # Backward
-            scaler.scale(loss_all).backward()
-            # loss_all.backward()
+            # scaler.scale(loss_all).backward()
+            loss_all.backward()
+            # loss_weighter.backward([loss_L1, loss_gan, loss_SR, loss_SM, loss_f[0]])
             optimizer_G.step() 
             optimizer_R_A.step()
+            # optimizer_awl.step()
+            # optimizer_awl.zero_grad()
 
             # Optimize
             if ni - last_opt_step >= accumulate:
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                # optimizer.step()
+                # scaler.step(optimizer)  # optimizer.step
+                # scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
                 if ema:
                     ema.update(model)
@@ -525,13 +739,17 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             if RANK in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%10s' * 2 + '%10.4g' * 9) % (
+                pbar.set_description(('%13s' * 2 + '%13.4g' * 12) % (
                     f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], gan_resize.shape[-1]))
                 callbacks.run('on_train_batch_end', ni, model, gan_resize, targets, paths, plots, opt.sync_bn)
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
-            
+            ## dwa2历史loss更新
+            # dwa2.update_train_loss_buffer([mloss[6] * 0.5, mloss[7] * 0.001, mloss[8] * 0.05, mloss[9] * 0.1, mloss[5] * 0.8], ni)
+        ## dwa历史loss更新
+        # dwa.update_train_loss_buffer([mloss[6] * 0.5, mloss[7] * 0.001, mloss[8] * 0.05, mloss[9] * 0.1, mloss[5] * 0.8], epoch)
+        
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
@@ -539,6 +757,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         scheduler_R_A.step()
         scheduler_G.step()
         scheduler_D.step()
+        # scheduler_awl.step()
 
         if RANK in [-1, 0]:
             # mAP
@@ -621,6 +840,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 strip_optimizer(f)  # strip optimizers
                 if f is best:
                     LOGGER.info(f'\nValidating {f}...')
+                    state_dict_netG = torch.load(g_best)
+                    if hasattr(state_dict_netG, '_metadata'):
+                        del state_dict_netG._metadata
+                    if isinstance(netG, torch.nn.DataParallel):
+                        netG.module.load_state_dict(state_dict_netG)
+                    else:
+                        device_ids = [int(id_) for id_ in opt.device.split(',')]
+                        netG.load_state_dict(state_dict_netG)
+                        netG = nn.DataParallel(netG, device_ids=device_ids) 
                     results, _, _ = val_gan_yolo.run(data_dict,
                                             batch_size=batch_size // WORLD_SIZE * 2,
                                             imgsz=imgsz,
@@ -650,7 +878,7 @@ def parse_opt(known=False):
     parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
-    parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
+    parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-gan.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')

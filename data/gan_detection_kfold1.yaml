@@ -1,0 +1,19 @@
+# COCO 2017 dataset http://cocodataset.org
+# Train command: python train.py --data coco.yaml
+# Default dataset location is next to /yolov5:
+#   /parent_folder
+#     /coco
+#     /yolov5
+
+# train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
+train_rgb: '/root/workspace/data/YoloGan/train_data/detection/01ct_class_5_data/kfold_1/train'  # 128 images
+val_rgb: '/root/workspace/data/YoloGan/train_data/detection/01ct_class_5_data/kfold_1/val' # 128 images
+train_ir: '/root/workspace/data/YoloGan/train_data/detection/01petct_nomix_class_5_data/kfold_1/train'  # 118287 images
+val_ir: '/root/workspace/data/YoloGan/train_data/detection/01petct_nomix_class_5_data/kfold_1/val'   # 5000 images
+
+
+# number of classes
+nc: 1
+
+# class names
+names: [ 'cancer' ]
